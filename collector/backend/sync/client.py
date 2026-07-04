@@ -12,6 +12,15 @@ STATE_DIR = Path("/app/state")
 COLLECTOR_ID_FILE = STATE_DIR / "collector_id"
 
 
+def get_cached_collector_id() -> str | None:
+    """Non-blocking read of the collector_id sync-agent already established.
+    Callers (e.g. the shipper) should use this instead of register() so
+    that only one process ever performs the registration HTTP round trip."""
+    if COLLECTOR_ID_FILE.exists():
+        return COLLECTOR_ID_FILE.read_text().strip()
+    return None
+
+
 def register() -> str:
     """Registers this collector with the cloud tenant, or reuses a saved collector_id."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)

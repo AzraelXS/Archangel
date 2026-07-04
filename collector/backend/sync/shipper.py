@@ -4,7 +4,7 @@ import os
 import requests
 
 from core.es_client import get_es_client
-from sync.client import register
+from sync.client import get_cached_collector_id
 
 log = logging.getLogger("sync-shipper")
 
@@ -20,8 +20,12 @@ def ship_backlog():
     shipped=false and get retried on the next run, so nothing is dropped
     on a failed push or a WAN outage.
     """
+    collector_id = get_cached_collector_id()
+    if collector_id is None:
+        log.info("not yet registered with cloud, skipping this cycle")
+        return
+
     es = get_es_client()
-    collector_id = register()
     cloud_api_url = os.environ["CLOUD_API_URL"].rstrip("/")
     api_key = os.environ["TENANT_API_KEY"]
 

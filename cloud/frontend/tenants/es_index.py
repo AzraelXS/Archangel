@@ -8,6 +8,8 @@ import secrets
 import uuid
 from datetime import datetime, timezone
 
+from elasticsearch import NotFoundError
+
 from dashboard.es_client import get_es_client
 
 TENANTS_INDEX = "archangel-tenants"
@@ -50,34 +52,35 @@ def get_tenant_by_api_key(raw_key: str) -> dict | None:
     return hits[0]["_source"] if hits else None
 
 
-def register_collector(tenant_id: str, name: str) -> dict:
-    """Idempotent on (tenant_id, name): returns the existing collector if already registered."""
-    es = get_es_client()
-    existing = es.search(
-        index=COLLECTORS_INDEX,
-        query={"bool": {"filter": [{"term": {"tenant_id": tenant_id}}, {"term": {"name": name}}]}},
-        size=1,
-        ignore_unavailable=True,
-    )
-    hits = existing["hits"]["hits"]
-    if hits:
-        collector_id = hits[0]["_id"]
-        es.update(
-            index=COLLECTORS_INDEX,
-            id=collector_id,
-            doc={"last_seen": _now(), "status": "online"},
-            refresh="wait_for",
-        )
-        return {**hits[0]["_source"], "collector_id": collector_id}
+def _collector_id_for(tenant_id: str, name: str) -> str:
+    """Deterministic id so concurrent registrations of the same (tenant_id, name)
+    always upsert the same document instead of racing on a search-then-create."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"archangel-collector:{tenant_id}:{name}"))
 
-    collector_id = str(uuid.uuid4())
+
+def register_collector(tenant_id: str, name: str) -> dict:
+    """
+    Idempotent on (tenant_id, name) by construction: the doc _id is derived
+    from those fields, so any number of concurrent callers upsert the same
+    document rather than racing a search-then-create and creating
+    duplicates.
+    """
+    es = get_es_client()
+    collector_id = _collector_id_for(tenant_id, name)
+    now = _now()
+    try:
+        existing = es.get(index=COLLECTORS_INDEX, id=collector_id)
+        registered_at = existing["_source"]["registered_at"]
+    except NotFoundError:
+        registered_at = now
+
     doc = {
         "collector_id": collector_id,
         "tenant_id": tenant_id,
         "name": name,
         "status": "online",
-        "registered_at": _now(),
-        "last_seen": _now(),
+        "registered_at": registered_at,
+        "last_seen": now,
     }
     es.index(index=COLLECTORS_INDEX, id=collector_id, document=doc, refresh="wait_for")
     return doc
