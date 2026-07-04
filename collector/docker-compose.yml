@@ -1,22 +1,24 @@
-name: ${COMPOSE_PROJECT_NAME:-archangel}
+name: ${COMPOSE_PROJECT_NAME:-archangel-collector}
 
 networks:
-  archangel-net:
+  archangel-collector-net:
     driver: bridge
 
 volumes:
   es-certs:
   es-data:
   redis-data:
+  collector-state:
 
 services:
 
   # ---------------------------------------------------------------------
-  # One-shot: generates a CA + node certs and sets built-in user passwords
+  # Local Elasticsearch: durable backlog for this collector's observed
+  # data (metrics/events/traps) before it's shipped to the cloud tenant.
   # ---------------------------------------------------------------------
   es-setup:
     image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
-    container_name: archangel-es-setup
+    container_name: archangel-collector-es-setup
     volumes:
       - es-certs:/usr/share/elasticsearch/config/certs
     user: "0"
@@ -36,11 +38,11 @@ services:
         find /usr/share/elasticsearch/config/certs -type f -name "*.key" -exec chmod 640 {} \;
       '
     networks:
-      - archangel-net
+      - archangel-collector-net
 
   es01:
     image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
-    container_name: archangel-es01
+    container_name: archangel-collector-es01
     depends_on:
       es-setup:
         condition: service_completed_successfully
@@ -81,71 +83,27 @@ services:
       timeout: 10s
       retries: 30
     networks:
-      - archangel-net
-
-  # Sets kibana_system password + creates an archangel API key / role once ES is up
-  es-init:
-    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
-    container_name: archangel-es-init
-    depends_on:
-      es01:
-        condition: service_healthy
-    volumes:
-      - es-certs:/usr/share/elasticsearch/config/certs
-    command: >
-      bash -c '
-        curl -s --cacert config/certs/ca/ca.crt -u elastic:${ELASTIC_PASSWORD} \
-          -X POST https://es01:9200/_security/user/kibana_system/_password \
-          -H "Content-Type: application/json" \
-          -d "{\"password\":\"${KIBANA_PASSWORD}\"}";
-        echo "es-init complete";
-      '
-    networks:
-      - archangel-net
-
-  kibana:
-    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
-    container_name: archangel-kibana
-    depends_on:
-      es-init:
-        condition: service_completed_successfully
-    ports:
-      - "${KIBANA_PORT}:5601"
-    environment:
-      - SERVERNAME=kibana
-      - ELASTICSEARCH_HOSTS=https://es01:9200
-      - ELASTICSEARCH_USERNAME=kibana_system
-      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
-      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
-    mem_limit: ${KIBANA_MEM_LIMIT}
-    volumes:
-      - es-certs:/usr/share/kibana/config/certs
-    healthcheck:
-      test: ["CMD-SHELL", "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302\\|HTTP/1.1 200'"]
-      interval: 10s
-      timeout: 10s
-      retries: 30
-    networks:
-      - archangel-net
+      - archangel-collector-net
 
   redis:
     image: redis:7-alpine
-    container_name: archangel-redis
+    container_name: archangel-collector-redis
     restart: unless-stopped
     ports:
       - "${REDIS_PORT}:6379"
     volumes:
       - redis-data:/data
     networks:
-      - archangel-net
+      - archangel-collector-net
 
   # ---------------------------------------------------------------------
-  # Core backend: polling engine, syslog automation, listeners
+  # Core: polling engine, syslog automation entry point
   # ---------------------------------------------------------------------
   core:
     build:
-      context: ./backend
-    container_name: archangel-core
+      context: ..
+      dockerfile: collector/backend/Dockerfile
+    container_name: archangel-collector-core
     command: ["python", "core/core.py"]
     depends_on:
       es01:
@@ -162,12 +120,13 @@ services:
       - ./backend:/app
       - es-certs:/certs:ro
     networks:
-      - archangel-net
+      - archangel-collector-net
 
   celery-worker:
     build:
-      context: ./backend
-    container_name: archangel-celery-worker
+      context: ..
+      dockerfile: collector/backend/Dockerfile
+    container_name: archangel-collector-celery-worker
     command: ["celery", "-A", "core.celery_app", "worker", "--loglevel=INFO"]
     depends_on:
       - redis
@@ -178,16 +137,21 @@ services:
       - ES_PASSWORD=${ELASTIC_PASSWORD}
       - ES_CA_CERT=/certs/ca/ca.crt
       - REDIS_URL=redis://redis:6379/0
+      - CLOUD_API_URL=${CLOUD_API_URL}
+      - TENANT_API_KEY=${TENANT_API_KEY}
+      - COLLECTOR_NAME=${COLLECTOR_NAME}
     volumes:
       - ./backend:/app
       - es-certs:/certs:ro
+      - collector-state:/app/state
     networks:
-      - archangel-net
+      - archangel-collector-net
 
   celery-beat:
     build:
-      context: ./backend
-    container_name: archangel-celery-beat
+      context: ..
+      dockerfile: collector/backend/Dockerfile
+    container_name: archangel-collector-celery-beat
     command: ["celery", "-A", "core.celery_app", "beat", "--loglevel=INFO"]
     depends_on:
       - redis
@@ -197,13 +161,42 @@ services:
     volumes:
       - ./backend:/app
       - es-certs:/certs:ro
+      - collector-state:/app/state
     networks:
-      - archangel-net
+      - archangel-collector-net
+
+  # ---------------------------------------------------------------------
+  # Sync agent: registers with the cloud tenant, ships local ES backlog
+  # ---------------------------------------------------------------------
+  sync-agent:
+    build:
+      context: ..
+      dockerfile: collector/backend/Dockerfile
+    container_name: archangel-collector-sync-agent
+    command: ["python", "sync/client.py"]
+    depends_on:
+      es01:
+        condition: service_healthy
+    environment:
+      - ES_HOST=https://es01:9200
+      - ES_USER=elastic
+      - ES_PASSWORD=${ELASTIC_PASSWORD}
+      - ES_CA_CERT=/certs/ca/ca.crt
+      - CLOUD_API_URL=${CLOUD_API_URL}
+      - TENANT_API_KEY=${TENANT_API_KEY}
+      - COLLECTOR_NAME=${COLLECTOR_NAME}
+    volumes:
+      - ./backend:/app
+      - es-certs:/certs:ro
+      - collector-state:/app/state
+    networks:
+      - archangel-collector-net
 
   snmp-trap-listener:
     build:
-      context: ./backend
-    container_name: archangel-snmp-trap-listener
+      context: ..
+      dockerfile: collector/backend/Dockerfile
+    container_name: archangel-collector-snmp-trap-listener
     command: ["python", "listeners/snmp_trap_listener.py"]
     ports:
       - "${SNMP_TRAP_PORT}:1162/udp"
@@ -213,12 +206,13 @@ services:
     volumes:
       - ./backend:/app
     networks:
-      - archangel-net
+      - archangel-collector-net
 
   smtp-listener:
     build:
-      context: ./backend
-    container_name: archangel-smtp-listener
+      context: ..
+      dockerfile: collector/backend/Dockerfile
+    container_name: archangel-collector-smtp-listener
     command: ["python", "listeners/smtp_listener.py"]
     ports:
       - "${SMTP_LISTEN_PORT}:1025"
@@ -228,45 +222,4 @@ services:
     volumes:
       - ./backend:/app
     networks:
-      - archangel-net
-
-  # ---------------------------------------------------------------------
-  # Django frontend (UI + API), talks to Elasticsearch directly, no RDBMS
-  # ---------------------------------------------------------------------
-  frontend:
-    build:
-      context: ./frontend
-    container_name: archangel-frontend
-    command: ["python", "manage.py", "runserver", "0.0.0.0:8000"]
-    ports:
-      - "${FRONTEND_PORT}:8000"
-    depends_on:
-      es01:
-        condition: service_healthy
-    environment:
-      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
-      - DJANGO_DEBUG=${DJANGO_DEBUG}
-      - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS}
-      - ES_HOST=https://es01:9200
-      - ES_USER=elastic
-      - ES_PASSWORD=${ELASTIC_PASSWORD}
-      - ES_CA_CERT=/certs/ca/ca.crt
-    volumes:
-      - ./frontend:/app
-      - es-certs:/certs:ro
-    networks:
-      - archangel-net
-
-  nginx:
-    image: nginx:stable-alpine
-    container_name: archangel-nginx
-    depends_on:
-      - frontend
-      - kibana
-    ports:
-      - "${HTTP_PORT}:80"
-      - "${HTTPS_PORT}:443"
-    volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
-    networks:
-      - archangel-net
+      - archangel-collector-net

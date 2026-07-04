@@ -5,3 +5,4 @@ pysnmp==4.4.12
 aiosmtpd==1.4.5
 python-dotenv==1.0.1
 pyyaml==6.0.2
+requests==2.32.3

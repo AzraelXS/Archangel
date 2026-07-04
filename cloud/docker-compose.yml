@@ -1,0 +1,170 @@
+name: ${COMPOSE_PROJECT_NAME:-archangel-cloud}
+
+networks:
+  archangel-cloud-net:
+    driver: bridge
+
+volumes:
+  es-certs:
+  es-data:
+
+services:
+
+  # ---------------------------------------------------------------------
+  # One-shot: generates a CA + node certs and sets built-in user passwords
+  # ---------------------------------------------------------------------
+  es-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: archangel-cloud-es-setup
+    volumes:
+      - es-certs:/usr/share/elasticsearch/config/certs
+    user: "0"
+    command: >
+      bash -c '
+        if [ ! -f /usr/share/elasticsearch/config/certs/ca.zip ]; then
+          bin/elasticsearch-certutil ca --silent --pem -out /usr/share/elasticsearch/config/certs/ca.zip;
+          unzip /usr/share/elasticsearch/config/certs/ca.zip -d /usr/share/elasticsearch/config/certs;
+          bin/elasticsearch-certutil cert --silent --pem -out /usr/share/elasticsearch/config/certs/certs.zip \
+            --ca-cert /usr/share/elasticsearch/config/certs/ca/ca.crt \
+            --ca-key /usr/share/elasticsearch/config/certs/ca/ca.key \
+            --name es01 --dns es01 --dns localhost --ip 127.0.0.1;
+          unzip /usr/share/elasticsearch/config/certs/certs.zip -d /usr/share/elasticsearch/config/certs;
+        fi;
+        chown -R 1000:0 /usr/share/elasticsearch/config/certs;
+        find /usr/share/elasticsearch/config/certs -type f -name "*.crt" -exec chmod 644 {} \;
+        find /usr/share/elasticsearch/config/certs -type f -name "*.key" -exec chmod 640 {} \;
+      '
+    networks:
+      - archangel-cloud-net
+
+  es01:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: archangel-cloud-es01
+    depends_on:
+      es-setup:
+        condition: service_completed_successfully
+    ports:
+      - "${ES_PORT}:9200"
+    environment:
+      - node.name=es01
+      - cluster.name=${CLUSTER_NAME}
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - bootstrap.memory_lock=true
+      - xpack.license.self_generated.type=${LICENSE}
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es01/es01.key
+      - xpack.security.http.ssl.certificate=certs/es01/es01.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es01/es01.key
+      - xpack.security.transport.ssl.certificate=certs/es01/es01.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    mem_limit: ${ES_MEM_LIMIT}
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+      - es-certs:/usr/share/elasticsearch/config/certs
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt -u elastic:${ELASTIC_PASSWORD} https://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    networks:
+      - archangel-cloud-net
+
+  # Sets kibana_system password once ES is up
+  es-init:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: archangel-cloud-es-init
+    depends_on:
+      es01:
+        condition: service_healthy
+    volumes:
+      - es-certs:/usr/share/elasticsearch/config/certs
+    command: >
+      bash -c '
+        curl -s --cacert config/certs/ca/ca.crt -u elastic:${ELASTIC_PASSWORD} \
+          -X POST https://es01:9200/_security/user/kibana_system/_password \
+          -H "Content-Type: application/json" \
+          -d "{\"password\":\"${KIBANA_PASSWORD}\"}";
+        echo "es-init complete";
+      '
+    networks:
+      - archangel-cloud-net
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    container_name: archangel-cloud-kibana
+    depends_on:
+      es-init:
+        condition: service_completed_successfully
+    ports:
+      - "${KIBANA_PORT}:5601"
+    environment:
+      - SERVERNAME=kibana
+      - ELASTICSEARCH_HOSTS=https://es01:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+    mem_limit: ${KIBANA_MEM_LIMIT}
+    volumes:
+      - es-certs:/usr/share/kibana/config/certs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302\\|HTTP/1.1 200'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    networks:
+      - archangel-cloud-net
+
+  # ---------------------------------------------------------------------
+  # Django frontend: interactive UI + tenant/collector registration & ingest API
+  # ---------------------------------------------------------------------
+  frontend:
+    build:
+      context: ..
+      dockerfile: cloud/frontend/Dockerfile
+    container_name: archangel-cloud-frontend
+    command: ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+    ports:
+      - "${FRONTEND_PORT}:8000"
+    depends_on:
+      es01:
+        condition: service_healthy
+    environment:
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
+      - DJANGO_DEBUG=${DJANGO_DEBUG}
+      - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS}
+      - ES_HOST=https://es01:9200
+      - ES_USER=elastic
+      - ES_PASSWORD=${ELASTIC_PASSWORD}
+      - ES_CA_CERT=/certs/ca/ca.crt
+    volumes:
+      - ./frontend:/app
+      - es-certs:/certs:ro
+    networks:
+      - archangel-cloud-net
+
+  nginx:
+    image: nginx:stable-alpine
+    container_name: archangel-cloud-nginx
+    depends_on:
+      - frontend
+      - kibana
+    ports:
+      - "${HTTP_PORT}:80"
+      - "${HTTPS_PORT}:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    networks:
+      - archangel-cloud-net

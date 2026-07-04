@@ -1,13 +1,12 @@
 .env
+.env.local
 *.pyc
 __pycache__/
 *.sqlite3
-elasticsearch/certs/*
-!elasticsearch/certs/.gitkeep
 secrets/*
 !secrets/.gitkeep
-frontend/staticfiles/
-frontend/media/
+cloud/frontend/staticfiles/
+cloud/frontend/media/
 .venv/
 venv/
 *.log

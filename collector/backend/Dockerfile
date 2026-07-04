@@ -7,9 +7,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsnmp-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY collector/backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY collector/backend/ .
+COPY common ./common
 
 CMD ["python", "core/core.py"]
