@@ -1,0 +1,15 @@
+.env
+*.pyc
+__pycache__/
+*.sqlite3
+elasticsearch/certs/*
+!elasticsearch/certs/.gitkeep
+secrets/*
+!secrets/.gitkeep
+frontend/staticfiles/
+frontend/media/
+.venv/
+venv/
+*.log
+.idea/
+.vscode/

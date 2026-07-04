@@ -1,0 +1,270 @@
+name: ${COMPOSE_PROJECT_NAME:-archangel}
+
+networks:
+  archangel-net:
+    driver: bridge
+
+volumes:
+  es-certs:
+  es-data:
+  redis-data:
+
+services:
+
+  # ---------------------------------------------------------------------
+  # One-shot: generates a CA + node certs and sets built-in user passwords
+  # ---------------------------------------------------------------------
+  es-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: archangel-es-setup
+    volumes:
+      - es-certs:/usr/share/elasticsearch/config/certs
+    user: "0"
+    command: >
+      bash -c '
+        if [ ! -f /usr/share/elasticsearch/config/certs/ca.zip ]; then
+          bin/elasticsearch-certutil ca --silent --pem -out /usr/share/elasticsearch/config/certs/ca.zip;
+          unzip /usr/share/elasticsearch/config/certs/ca.zip -d /usr/share/elasticsearch/config/certs;
+          bin/elasticsearch-certutil cert --silent --pem -out /usr/share/elasticsearch/config/certs/certs.zip \
+            --ca-cert /usr/share/elasticsearch/config/certs/ca/ca.crt \
+            --ca-key /usr/share/elasticsearch/config/certs/ca/ca.key \
+            --name es01 --dns es01 --dns localhost --ip 127.0.0.1;
+          unzip /usr/share/elasticsearch/config/certs/certs.zip -d /usr/share/elasticsearch/config/certs;
+        fi;
+        chown -R 1000:0 /usr/share/elasticsearch/config/certs;
+        find /usr/share/elasticsearch/config/certs -type f -name "*.crt" -exec chmod 644 {} \;
+        find /usr/share/elasticsearch/config/certs -type f -name "*.key" -exec chmod 640 {} \;
+      '
+    networks:
+      - archangel-net
+
+  es01:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: archangel-es01
+    depends_on:
+      es-setup:
+        condition: service_completed_successfully
+    ports:
+      - "${ES_PORT}:9200"
+    environment:
+      - node.name=es01
+      - cluster.name=${CLUSTER_NAME}
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - bootstrap.memory_lock=true
+      - xpack.license.self_generated.type=${LICENSE}
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es01/es01.key
+      - xpack.security.http.ssl.certificate=certs/es01/es01.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es01/es01.key
+      - xpack.security.transport.ssl.certificate=certs/es01/es01.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    mem_limit: ${ES_MEM_LIMIT}
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+      - es-certs:/usr/share/elasticsearch/config/certs
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt -u elastic:${ELASTIC_PASSWORD} https://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    networks:
+      - archangel-net
+
+  # Sets kibana_system password + creates an archangel API key / role once ES is up
+  es-init:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: archangel-es-init
+    depends_on:
+      es01:
+        condition: service_healthy
+    volumes:
+      - es-certs:/usr/share/elasticsearch/config/certs
+    command: >
+      bash -c '
+        curl -s --cacert config/certs/ca/ca.crt -u elastic:${ELASTIC_PASSWORD} \
+          -X POST https://es01:9200/_security/user/kibana_system/_password \
+          -H "Content-Type: application/json" \
+          -d "{\"password\":\"${KIBANA_PASSWORD}\"}";
+        echo "es-init complete";
+      '
+    networks:
+      - archangel-net
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    container_name: archangel-kibana
+    depends_on:
+      es-init:
+        condition: service_completed_successfully
+    ports:
+      - "${KIBANA_PORT}:5601"
+    environment:
+      - SERVERNAME=kibana
+      - ELASTICSEARCH_HOSTS=https://es01:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+    mem_limit: ${KIBANA_MEM_LIMIT}
+    volumes:
+      - es-certs:/usr/share/kibana/config/certs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302\\|HTTP/1.1 200'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    networks:
+      - archangel-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: archangel-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - archangel-net
+
+  # ---------------------------------------------------------------------
+  # Core backend: polling engine, syslog automation, listeners
+  # ---------------------------------------------------------------------
+  core:
+    build:
+      context: ./backend
+    container_name: archangel-core
+    command: ["python", "core/core.py"]
+    depends_on:
+      es01:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      - ES_HOST=https://es01:9200
+      - ES_USER=elastic
+      - ES_PASSWORD=${ELASTIC_PASSWORD}
+      - ES_CA_CERT=/certs/ca/ca.crt
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+      - es-certs:/certs:ro
+    networks:
+      - archangel-net
+
+  celery-worker:
+    build:
+      context: ./backend
+    container_name: archangel-celery-worker
+    command: ["celery", "-A", "core.celery_app", "worker", "--loglevel=INFO"]
+    depends_on:
+      - redis
+      - core
+    environment:
+      - ES_HOST=https://es01:9200
+      - ES_USER=elastic
+      - ES_PASSWORD=${ELASTIC_PASSWORD}
+      - ES_CA_CERT=/certs/ca/ca.crt
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+      - es-certs:/certs:ro
+    networks:
+      - archangel-net
+
+  celery-beat:
+    build:
+      context: ./backend
+    container_name: archangel-celery-beat
+    command: ["celery", "-A", "core.celery_app", "beat", "--loglevel=INFO"]
+    depends_on:
+      - redis
+      - core
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+      - es-certs:/certs:ro
+    networks:
+      - archangel-net
+
+  snmp-trap-listener:
+    build:
+      context: ./backend
+    container_name: archangel-snmp-trap-listener
+    command: ["python", "listeners/snmp_trap_listener.py"]
+    ports:
+      - "${SNMP_TRAP_PORT}:1162/udp"
+    environment:
+      - SYSLOG_FORWARD_HOST=core
+      - SYSLOG_FORWARD_PORT=${SYSLOG_UDP_PORT}
+    volumes:
+      - ./backend:/app
+    networks:
+      - archangel-net
+
+  smtp-listener:
+    build:
+      context: ./backend
+    container_name: archangel-smtp-listener
+    command: ["python", "listeners/smtp_listener.py"]
+    ports:
+      - "${SMTP_LISTEN_PORT}:1025"
+    environment:
+      - SYSLOG_FORWARD_HOST=core
+      - SYSLOG_FORWARD_PORT=${SYSLOG_UDP_PORT}
+    volumes:
+      - ./backend:/app
+    networks:
+      - archangel-net
+
+  # ---------------------------------------------------------------------
+  # Django frontend (UI + API), talks to Elasticsearch directly, no RDBMS
+  # ---------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+    container_name: archangel-frontend
+    command: ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+    depends_on:
+      es01:
+        condition: service_healthy
+    environment:
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
+      - DJANGO_DEBUG=${DJANGO_DEBUG}
+      - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS}
+      - ES_HOST=https://es01:9200
+      - ES_USER=elastic
+      - ES_PASSWORD=${ELASTIC_PASSWORD}
+      - ES_CA_CERT=/certs/ca/ca.crt
+    volumes:
+      - ./frontend:/app
+      - es-certs:/certs:ro
+    networks:
+      - archangel-net
+
+  nginx:
+    image: nginx:stable-alpine
+    container_name: archangel-nginx
+    depends_on:
+      - frontend
+      - kibana
+    ports:
+      - "${HTTP_PORT}:80"
+      - "${HTTPS_PORT}:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    networks:
+      - archangel-net
