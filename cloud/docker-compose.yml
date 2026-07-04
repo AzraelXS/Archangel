@@ -40,6 +40,7 @@ services:
   es01:
     image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
     container_name: archangel-cloud-es01
+    restart: unless-stopped
     depends_on:
       es-setup:
         condition: service_completed_successfully
@@ -105,6 +106,7 @@ services:
   kibana:
     image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
     container_name: archangel-cloud-kibana
+    restart: unless-stopped
     depends_on:
       es-init:
         condition: service_completed_successfully
@@ -136,6 +138,7 @@ services:
       dockerfile: cloud/frontend/Dockerfile
     container_name: archangel-cloud-frontend
     command: ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+    restart: unless-stopped
     ports:
       - "${FRONTEND_PORT}:8000"
     depends_on:
@@ -158,6 +161,7 @@ services:
   nginx:
     image: nginx:stable-alpine
     container_name: archangel-cloud-nginx
+    restart: unless-stopped
     depends_on:
       - frontend
       - kibana

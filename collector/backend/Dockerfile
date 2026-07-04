@@ -13,4 +13,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY collector/backend/ .
 COPY common ./common
 
-CMD ["python", "core/core.py"]
+CMD ["python", "-m", "core.core"]

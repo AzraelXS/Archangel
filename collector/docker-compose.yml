@@ -43,6 +43,7 @@ services:
   es01:
     image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
     container_name: archangel-collector-es01
+    restart: unless-stopped
     depends_on:
       es-setup:
         condition: service_completed_successfully
@@ -104,7 +105,8 @@ services:
       context: ..
       dockerfile: collector/backend/Dockerfile
     container_name: archangel-collector-core
-    command: ["python", "core/core.py"]
+    command: ["python", "-m", "core.core"]
+    restart: unless-stopped
     depends_on:
       es01:
         condition: service_healthy
@@ -128,6 +130,7 @@ services:
       dockerfile: collector/backend/Dockerfile
     container_name: archangel-collector-celery-worker
     command: ["celery", "-A", "core.celery_app", "worker", "--loglevel=INFO"]
+    restart: unless-stopped
     depends_on:
       - redis
       - core
@@ -153,6 +156,7 @@ services:
       dockerfile: collector/backend/Dockerfile
     container_name: archangel-collector-celery-beat
     command: ["celery", "-A", "core.celery_app", "beat", "--loglevel=INFO"]
+    restart: unless-stopped
     depends_on:
       - redis
       - core
@@ -173,7 +177,8 @@ services:
       context: ..
       dockerfile: collector/backend/Dockerfile
     container_name: archangel-collector-sync-agent
-    command: ["python", "sync/client.py"]
+    command: ["python", "-m", "sync.client"]
+    restart: unless-stopped
     depends_on:
       es01:
         condition: service_healthy
@@ -197,7 +202,8 @@ services:
       context: ..
       dockerfile: collector/backend/Dockerfile
     container_name: archangel-collector-snmp-trap-listener
-    command: ["python", "listeners/snmp_trap_listener.py"]
+    command: ["python", "-m", "listeners.snmp_trap_listener"]
+    restart: unless-stopped
     ports:
       - "${SNMP_TRAP_PORT}:1162/udp"
     environment:
@@ -213,7 +219,8 @@ services:
       context: ..
       dockerfile: collector/backend/Dockerfile
     container_name: archangel-collector-smtp-listener
-    command: ["python", "listeners/smtp_listener.py"]
+    command: ["python", "-m", "listeners.smtp_listener"]
+    restart: unless-stopped
     ports:
       - "${SMTP_LISTEN_PORT}:1025"
     environment:
