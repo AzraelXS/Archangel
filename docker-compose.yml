@@ -238,6 +238,8 @@ services:
       context: ./frontend
     container_name: archangel-frontend
     command: ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+    ports:
+      - "${FRONTEND_PORT}:8000"
     depends_on:
       es01:
         condition: service_healthy
