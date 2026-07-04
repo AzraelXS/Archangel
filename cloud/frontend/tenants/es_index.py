@@ -44,6 +44,7 @@ def get_tenant_by_api_key(raw_key: str) -> dict | None:
         index=TENANTS_INDEX,
         query={"term": {"api_key_hash": key_hash}},
         size=1,
+        ignore_unavailable=True,
     )
     hits = result["hits"]["hits"]
     return hits[0]["_source"] if hits else None
@@ -56,6 +57,7 @@ def register_collector(tenant_id: str, name: str) -> dict:
         index=COLLECTORS_INDEX,
         query={"bool": {"filter": [{"term": {"tenant_id": tenant_id}}, {"term": {"name": name}}]}},
         size=1,
+        ignore_unavailable=True,
     )
     hits = existing["hits"]["hits"]
     if hits:
