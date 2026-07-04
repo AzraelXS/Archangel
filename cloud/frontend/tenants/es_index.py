@@ -89,3 +89,28 @@ def register_collector(tenant_id: str, name: str) -> dict:
 def touch_collector(collector_id: str) -> None:
     es = get_es_client()
     es.update(index=COLLECTORS_INDEX, id=collector_id, doc={"last_seen": _now(), "status": "online"})
+
+
+def list_tenants() -> list[dict]:
+    es = get_es_client()
+    result = es.search(
+        index=TENANTS_INDEX,
+        query={"match_all": {}},
+        sort=[{"created_at": "desc"}],
+        size=200,
+        ignore_unavailable=True,
+    )
+    return [hit["_source"] for hit in result["hits"]["hits"]]
+
+
+def list_collectors(tenant_id: str | None = None) -> list[dict]:
+    es = get_es_client()
+    query = {"term": {"tenant_id": tenant_id}} if tenant_id else {"match_all": {}}
+    result = es.search(
+        index=COLLECTORS_INDEX,
+        query=query,
+        sort=[{"last_seen": "desc"}],
+        size=500,
+        ignore_unavailable=True,
+    )
+    return [hit["_source"] for hit in result["hits"]["hits"]]

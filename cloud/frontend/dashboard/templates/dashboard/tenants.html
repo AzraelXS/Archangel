@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Archangel — Tenants</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; background: #111; color: #eee; }
+    h1 { font-weight: 600; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; }
+    th, td { text-align: left; padding: 0.5rem 1rem; border-bottom: 1px solid #333; }
+    th { color: #888; font-weight: 500; text-transform: uppercase; font-size: 0.75rem; }
+    .tenant-name { font-size: 1.1rem; font-weight: 600; margin-top: 2rem; }
+    .status-online { color: #4caf50; }
+    .empty { color: #666; font-style: italic; padding: 0.5rem 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Tenants &amp; Collectors</h1>
+
+  {% for tenant in tenants %}
+    <div class="tenant-name">{{ tenant.name }} <small style="color:#666">({{ tenant.tenant_id }})</small></div>
+    {% if tenant.collectors %}
+      <table>
+        <thead>
+          <tr><th>Collector</th><th>Status</th><th>Last seen</th><th>Registered</th></tr>
+        </thead>
+        <tbody>
+          {% for collector in tenant.collectors %}
+          <tr>
+            <td>{{ collector.name }}</td>
+            <td class="status-{{ collector.status }}">{{ collector.status }}</td>
+            <td>{{ collector.last_seen }}</td>
+            <td>{{ collector.registered_at }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="empty">No collectors registered yet.</div>
+    {% endif %}
+  {% empty %}
+    <div class="empty">No tenants yet.</div>
+  {% endfor %}
+</body>
+</html>
